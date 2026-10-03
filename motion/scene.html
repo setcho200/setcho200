@@ -1,0 +1,583 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>LSG Racing Motion</title>
+<style>
+  html, body { margin: 0; background: #000; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1920" height="1080"></canvas>
+<script>
+// ---------------------------------------------------------------------------
+// LSG Racing — 15s motion design. Deterministic: render(frame) draws one frame.
+// ---------------------------------------------------------------------------
+const W = 1920, H = 1080, FPS = 30, DUR = 15, CX = W / 2, CY = H / 2;
+const cv = document.getElementById('c');
+let ctx = cv.getContext('2d');
+const LIME = '#a6e22e', LIME2 = '#7ed321', DEEP = '#1f6b1a';
+
+// ---------- helpers ----------
+const clamp = (x, a = 0, b = 1) => Math.max(a, Math.min(b, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const prog = (t, a, b) => clamp((t - a) / (b - a));
+const eOutCubic = t => 1 - Math.pow(1 - t, 3);
+const eInOutCubic = t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+const eOutExpo = t => t === 1 ? 1 : 1 - Math.pow(2, -10 * t);
+const eInExpo = t => t === 0 ? 0 : Math.pow(2, 10 * t - 10);
+const eOutBack = t => { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); };
+const eInBack = t => { const c1 = 1.70158, c3 = c1 + 1; return c3 * t * t * t - c1 * t * t; };
+const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a)); return t * t * (3 - 2 * t); };
+function rng(seed) { return function () { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const hash = n => { const r = rng(n * 7919 + 13); return r(); };
+function mk(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
+
+// ---------- logo extraction ----------
+const UP = 6;           // supersampling of the extracted mask
+let pieces = {};        // lion, letters...
+let logoBox;            // content bbox in source px
+let S_FINAL, S_LION;    // screen px per source px
+
+function tint(src, color) {
+  const c = mk(src.width, src.height), x = c.getContext('2d');
+  x.drawImage(src, 0, 0);
+  x.globalCompositeOperation = 'source-in';
+  x.fillStyle = color; x.fillRect(0, 0, c.width, c.height);
+  return c;
+}
+
+function prepare(img) {
+  const w = img.width, h = img.height;
+  const s = mk(w, h), sx = s.getContext('2d');
+  sx.drawImage(img, 0, 0);
+  const d = sx.getImageData(0, 0, w, h), p = d.data;
+  const A = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) {
+    const r = p[i * 4], b = p[i * 4 + 2];
+    let a = clamp((Math.min(r, b) - 70) / 130);
+    const x = i % w, y = (i / w) | 0;
+    if (x < 3 || y < 3 || x > w - 4 || y > h - 4) a = 0;
+    A[i] = a;
+    p[i * 4] = p[i * 4 + 1] = p[i * 4 + 2] = 255; p[i * 4 + 3] = a * 255;
+  }
+  sx.putImageData(d, 0, 0);
+
+  // upscale + soften + threshold => crisp vector-like edges
+  const big = mk(w * UP, h * UP), bx = big.getContext('2d');
+  bx.imageSmoothingEnabled = true; bx.imageSmoothingQuality = 'high';
+  bx.filter = `blur(${UP * 0.35}px)`;
+  bx.drawImage(s, 0, 0, w * UP, h * UP);
+  bx.filter = 'none';
+  const bd = bx.getImageData(0, 0, big.width, big.height), bp = bd.data;
+  for (let i = 3; i < bp.length; i += 4) bp[i] = smooth(0.38, 0.62, bp[i] / 255) * 255;
+  bx.putImageData(bd, 0, 0);
+
+  // horizontal bands (lion / LSG / RACING)
+  const on = (x, y) => A[y * w + x] > 0.5;
+  const rows = [];
+  for (let y = 0; y < h; y++) { let n = 0; for (let x = 0; x < w; x++) if (on(x, y)) n++; rows.push(n); }
+  let bands = [], cur = null, gap = 0;
+  for (let y = 0; y < h; y++) {
+    if (rows[y] > 0) { if (!cur) cur = { y0: y, y1: y }; cur.y1 = y; gap = 0; }
+    else if (cur) { gap++; if (gap > 2) { bands.push(cur); cur = null; } }
+  }
+  if (cur) bands.push(cur);
+  bands = bands.filter(b => b.y1 - b.y0 >= 3);
+  const racingB = bands[bands.length - 1], lsgB = bands[bands.length - 2];
+  const lionB = { y0: bands[0].y0, y1: bands[bands.length - 3].y1 };
+
+  function colsIn(b, minGap) {
+    const segs = []; let c = null, g = 0;
+    for (let x = 0; x < w; x++) {
+      let any = false; for (let y = b.y0; y <= b.y1; y++) if (on(x, y)) { any = true; break; }
+      if (any) { if (!c) c = { x0: x, x1: x }; c.x1 = x; g = 0; }
+      else if (c) { g++; if (g >= minGap) { segs.push(c); c = null; } }
+    }
+    if (c) segs.push(c);
+    return segs.filter(s => s.x1 - s.x0 >= 1);
+  }
+  function cut(x0, y0, x1, y1, pad = 2) {
+    x0 -= pad; y0 -= pad; x1 += pad; y1 += pad;
+    const c = mk((x1 - x0 + 1) * UP, (y1 - y0 + 1) * UP);
+    c.getContext('2d').drawImage(big, x0 * UP, y0 * UP, c.width, c.height, 0, 0, c.width, c.height);
+    return { c, x0, y0, w: x1 - x0 + 1, h: y1 - y0 + 1, cx: (x0 + x1 + 1) / 2, cy: (y0 + y1 + 1) / 2 };
+  }
+  const lionCols = colsIn(lionB, 4);
+  const lx0 = Math.min(...lionCols.map(s => s.x0)), lx1 = Math.max(...lionCols.map(s => s.x1));
+  pieces.lion = cut(lx0, lionB.y0, lx1, lionB.y1);
+  // L, S and G touch in the source logo: split the band at the thinnest columns near 1/3 and 2/3
+  let lsgSegs = colsIn(lsgB, 1);
+  if (lsgSegs.length < 3) {
+    const sx0 = lsgSegs[0].x0, sx1 = lsgSegs[lsgSegs.length - 1].x1, sw = sx1 - sx0;
+    const ink = x => { let n = 0; for (let y = lsgB.y0; y <= lsgB.y1; y++) if (on(x, y)) n++; return n; };
+    const splitNear = f => { let best = 0, bv = 1e9; for (let x = Math.round(sx0 + sw * (f - .12)); x <= Math.round(sx0 + sw * (f + .12)); x++) { const v = ink(x); if (v < bv) { bv = v; best = x; } } return best; };
+    const a = splitNear(1 / 3), b = splitNear(2 / 3);
+    lsgSegs = [{ x0: sx0, x1: a }, { x0: a + 1, x1: b }, { x0: b + 1, x1: sx1 }];
+  }
+  pieces.lsg = lsgSegs.map(s => cut(s.x0, lsgB.y0, s.x1, lsgB.y1, 0));
+  pieces.racing = colsIn(racingB, 1).map(s => cut(s.x0, racingB.y0, s.x1, racingB.y1));
+  pieces.lion.lime = tint(pieces.lion.c, LIME);
+  pieces.lion.deep = tint(pieces.lion.c, '#0d3b0b');
+
+  const all = [pieces.lion, ...pieces.lsg, ...pieces.racing];
+  const bx0 = Math.min(...all.map(p => p.x0)), bx1 = Math.max(...all.map(p => p.x0 + p.w));
+  const by0 = Math.min(...all.map(p => p.y0)), by1 = Math.max(...all.map(p => p.y0 + p.h));
+  logoBox = { x0: bx0, y0: by0, x1: bx1, y1: by1, cx: (bx0 + bx1) / 2, cy: (by0 + by1) / 2 };
+  S_FINAL = 900 / (by1 - by0);
+  S_LION = 760 / pieces.lion.h;
+
+  buildParticles();
+  window.__debug = { bands, lsg: pieces.lsg.length, racing: pieces.racing.length, logoBox };
+}
+
+// screen position of a piece in the final lock-up
+const finalPos = p => ({ x: CX + (p.cx - logoBox.cx) * S_FINAL, y: CY + (p.cy - logoBox.cy) * S_FINAL });
+const LION_STAGE = { x: CX, y: CY };
+
+function drawPiece(c, p, x, y, scale, opt = {}) {
+  const sw = p.w * scale, sh = p.h * scale;
+  ctx.save();
+  ctx.globalAlpha = opt.alpha ?? 1;
+  ctx.translate(x, y);
+  if (opt.rot) ctx.rotate(opt.rot);
+  if (opt.skew) ctx.transform(1, 0, opt.skew, 1, 0, 0);
+  ctx.scale(opt.sx ?? 1, opt.sy ?? 1);
+  ctx.drawImage(c, -sw / 2, -sh / 2, sw, sh);
+  ctx.restore();
+}
+
+// ---------- particles (lion assembly) ----------
+let parts = [];
+function buildParticles() {
+  const p = pieces.lion, c = p.c, x = c.getContext('2d');
+  const d = x.getImageData(0, 0, c.width, c.height).data;
+  const r = rng(42), step = 9;
+  for (let y = 0; y < c.height; y += step) for (let xx = 0; xx < c.width; xx += step) {
+    const jx = xx + (r() - .5) * step, jy = y + (r() - .5) * step;
+    const ix = clamp(jx | 0, 0, c.width - 1), iy = clamp(jy | 0, 0, c.height - 1);
+    if (d[(iy * c.width + ix) * 4 + 3] > 128) {
+      const ang = r() * Math.PI * 2, rad = 250 + r() * 750;
+      parts.push({
+        u: ix / c.width - .5, v: iy / c.height - .5,
+        ex: Math.cos(ang) * rad, ey: Math.sin(ang) * rad * 0.7,
+        swirl: (r() - .5) * 2.4, delay: r() * 0.55 + (iy / c.height) * 0.35,
+        size: 3 + r() * 3.5, hue: r()
+      });
+    }
+  }
+}
+
+// ---------- shapes for morph ----------
+const NPTS = 360;
+function polyPts(n, rot = -Math.PI / 2, rad = 1) {
+  const v = []; for (let i = 0; i < n; i++) { const a = rot + i * 2 * Math.PI / n; v.push([Math.cos(a) * rad, Math.sin(a) * rad]); }
+  const out = [];
+  for (let i = 0; i < NPTS; i++) {
+    const f = i / NPTS * n, k = Math.floor(f), t = f - k;
+    const a = v[k % n], b = v[(k + 1) % n];
+    out.push([lerp(a[0], b[0], t), lerp(a[1], b[1], t)]);
+  }
+  return out;
+}
+function circlePts() { const o = []; for (let i = 0; i < NPTS; i++) { const a = -Math.PI / 2 + i * 2 * Math.PI / NPTS; o.push([Math.cos(a), Math.sin(a)]); } return o; }
+function starPts() {
+  const o = []; for (let i = 0; i < NPTS; i++) {
+    const a = -Math.PI / 2 + i * 2 * Math.PI / NPTS;
+    const f = (i / NPTS * 10) % 2, rr = f < 1 ? lerp(1.05, .5, f) : lerp(.5, 1.05, f - 1);
+    o.push([Math.cos(a) * rr, Math.sin(a) * rr]);
+  } return o;
+}
+const SHAPES = [circlePts(), polyPts(3, -Math.PI / 2, 1.15), polyPts(4, -Math.PI / 4, 1.05), polyPts(6, -Math.PI / 2, 1), starPts(), circlePts()];
+
+// ---------- streaks ----------
+const streaks = []; { const r = rng(7); for (let i = 0; i < 260; i++) streaks.push({ a: r() * Math.PI * 2, z: r(), w: 1 + r() * 3, l: .08 + r() * .25, c: r() }); }
+const dust = []; { const r = rng(99); for (let i = 0; i < 90; i++) dust.push({ x: r() * W, y: r() * H, s: 1 + r() * 3, v: 20 + r() * 60, ph: r() * 6 }); }
+
+// ---------- layers ----------
+const fg = mk(W, H), fgx = fg.getContext('2d');
+
+// ===========================================================================
+function background(t) {
+  // dark base
+  const g = ctx.createRadialGradient(CX, CY, 50, CX, CY, 1200);
+  g.addColorStop(0, '#0f1d0e'); g.addColorStop(1, '#010301');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+
+  // perspective racing grid (2.4 -> 9.8)
+  const gridA = Math.min(prog(t, 2.2, 2.8), 1 - prog(t, 9.4, 10.2)) * 0.5;
+  if (gridA > 0) {
+    ctx.save(); ctx.globalAlpha = gridA; ctx.strokeStyle = LIME2; ctx.lineWidth = 2;
+    const hy = CY + 40, speed = t < 5 ? (t - 2.4) * 2.5 : 6.5 + (t - 5) * 0.8;
+    for (let i = -14; i <= 14; i++) { ctx.beginPath(); ctx.moveTo(CX + i * 18, hy); ctx.lineTo(CX + i * 260, H + 20); ctx.stroke(); }
+    for (let k = 0; k < 14; k++) {
+      const z = ((k + speed * 2) % 14) / 14, y = hy + Math.pow(z, 3) * (H - hy + 40);
+      ctx.globalAlpha = gridA * z; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    }
+    // fade toward horizon
+    const fade = ctx.createLinearGradient(0, hy, 0, hy + 260);
+    fade.addColorStop(0, 'rgba(1,3,1,1)'); fade.addColorStop(1, 'rgba(1,3,1,0)');
+    ctx.globalAlpha = 1; ctx.fillStyle = fade; ctx.fillRect(0, hy - 2, W, 262);
+    ctx.restore();
+  }
+
+  // green brand wipe (9.8 -> 10.8), then brand gradient
+  const wp = eInOutCubic(prog(t, 9.75, 10.75));
+  if (wp > 0) {
+    ctx.save();
+    ctx.beginPath(); ctx.arc(LION_STAGE.x, LION_STAGE.y, wp * 1250, 0, Math.PI * 2); ctx.clip();
+    const lg = ctx.createLinearGradient(W, 0, 0, H);
+    lg.addColorStop(0, '#9be22d'); lg.addColorStop(0.55, '#3f9e24'); lg.addColorStop(1, '#155314');
+    ctx.fillStyle = lg; ctx.fillRect(0, 0, W, H);
+    // soft light bloom
+    const rg = ctx.createRadialGradient(CX + 300, CY - 260, 0, CX + 300, CY - 260, 900);
+    rg.addColorStop(0, 'rgba(230,255,170,.35)'); rg.addColorStop(1, 'rgba(230,255,170,0)');
+    ctx.fillStyle = rg; ctx.fillRect(0, 0, W, H);
+    // diagonal speed stripes
+    ctx.globalAlpha = 0.07; ctx.fillStyle = '#fff';
+    const off = (t * 220) % 240;
+    for (let i = -10; i < 20; i++) { ctx.beginPath(); const x = i * 240 + off; ctx.moveTo(x, 0); ctx.lineTo(x + 70, 0); ctx.lineTo(x - 470, H); ctx.lineTo(x - 540, H); ctx.fill(); }
+    ctx.restore();
+    // wipe ring
+    if (wp < 1) {
+      ctx.save(); ctx.strokeStyle = '#eaffc0'; ctx.lineWidth = 18 * (1 - wp) + 2; ctx.globalAlpha = 1 - wp;
+      ctx.beginPath(); ctx.arc(LION_STAGE.x, LION_STAGE.y, wp * 1250, 0, Math.PI * 2); ctx.stroke(); ctx.restore();
+    }
+  }
+}
+
+// ---------- Scene A : start lights 0 -> 2.4 ----------
+function sceneLights(t, c) {
+  if (t > 2.45) return;
+  const panelIn = eOutBack(prog(t, 0.05, 0.5)), panelOut = eInBack(prog(t, 1.95, 2.25));
+  const sp = 150, R = 52, n = 5;
+  c.save();
+  c.translate(CX, CY);
+  const ps = panelIn * (1 - panelOut);
+  if (ps > 0.001) {
+    c.save(); c.scale(ps, ps);
+    c.fillStyle = '#0b0f0b'; c.strokeStyle = '#2b3a2a'; c.lineWidth = 4;
+    c.beginPath(); c.roundRect(-sp * 2 - 95, -95, sp * 4 + 190, 190, 40); c.fill(); c.stroke();
+    // brackets
+    c.fillStyle = '#1c261b';
+    for (let i = 0; i < n; i++) { c.fillRect((i - 2) * sp - 6, -200, 12, 110); }
+    c.restore();
+  }
+  for (let i = 0; i < n; i++) {
+    const onT = 0.45 + i * 0.3, lit = t >= onT && t < 2.0;
+    const pop = eOutBack(prog(t, onT, onT + 0.15));
+    let x = (i - 2) * sp, y = 0, r = R * Math.max(ps, prog(t, 1.95, 2.0) > 0 ? 1 : 0);
+    // after lights-out: go green, fly to centre and merge
+    const m = eInOutCubic(prog(t, 2.0, 2.4));
+    if (t >= 2.0) { x = lerp(x, 0, m); r = lerp(R, 60, m) * (1 + 0.25 * Math.sin(m * Math.PI)); }
+    if (r <= 0.5) continue;
+    c.save();
+    if (t >= 2.0) {
+      c.shadowColor = LIME; c.shadowBlur = 60; c.fillStyle = LIME;
+      c.globalAlpha = 1;
+    } else if (lit) {
+      c.shadowColor = '#ff2a1a'; c.shadowBlur = 50 * pop;
+      const g = c.createRadialGradient(x - 12, y - 12, 4, x, y, r);
+      g.addColorStop(0, '#ffd2c8'); g.addColorStop(.35, '#ff3b22'); g.addColorStop(1, '#8a0b02');
+      c.fillStyle = g;
+    } else { c.fillStyle = '#1a1f1a'; }
+    c.beginPath(); c.arc(x, y, r * (lit && t < 2 ? 0.9 + 0.1 * pop : 1), 0, Math.PI * 2); c.fill();
+    c.restore();
+  }
+  c.restore();
+  // "LIGHTS OUT" caption
+  const capA = prog(t, 2.0, 2.08) * (1 - prog(t, 2.3, 2.45));
+  if (capA > 0) {
+    c.save(); c.globalAlpha = capA; c.fillStyle = '#fff'; c.font = '700 44px "DejaVu Sans"';
+    c.textAlign = 'center'; c.letterSpacing = `${lerp(30, 14, prog(t, 2, 2.4))}px`;
+    c.fillText('LIGHTS OUT', CX, CY + 190); c.restore();
+  }
+}
+
+// ---------- Scene B : warp + shape morph 2.4 -> 5.0 ----------
+function sceneMorph(t, c) {
+  if (t < 2.0 || t > 5.4) return;
+  // warp streaks
+  const sa = Math.min(prog(t, 2.0, 2.5), 1 - prog(t, 5.0, 5.4));
+  if (sa > 0) {
+    const sp = 0.25 + eInExpo(prog(t, 2.0, 5.0)) * 2.2;
+    c.save(); c.lineCap = 'round';
+    for (const s of streaks) {
+      const z = (s.z + (t - 2) * sp * 0.6) % 1, r0 = 80 + Math.pow(z, 2.2) * 1300, r1 = r0 * (1 + s.l * (0.5 + sp));
+      c.strokeStyle = s.c > .7 ? '#ffffff' : LIME; c.globalAlpha = sa * z * 0.9; c.lineWidth = s.w * (0.4 + z);
+      c.beginPath(); c.moveTo(CX + Math.cos(s.a) * r0, CY + Math.sin(s.a) * r0); c.lineTo(CX + Math.cos(s.a) * r1, CY + Math.sin(s.a) * r1); c.stroke();
+    }
+    c.restore();
+  }
+  // kinetic words
+  const words = [['SPEED', 2.55], ['POWER', 3.2], ['PRIDE', 3.85]];
+  for (const [w, t0] of words) {
+    const p = prog(t, t0, t0 + 0.7); if (p <= 0 || p >= 1) continue;
+    const a = Math.sin(p * Math.PI);
+    c.save(); c.translate(CX, CY); c.scale(lerp(0.85, 1.25, eOutCubic(p)), lerp(0.85, 1.25, eOutCubic(p)));
+    c.font = '900 330px "DejaVu Sans"'; c.textAlign = 'center'; c.textBaseline = 'middle';
+    c.letterSpacing = '20px';
+    c.globalAlpha = a * 0.35; c.strokeStyle = LIME; c.lineWidth = 3; c.strokeText(w, 0, 0);
+    c.globalAlpha = a * 0.08; c.fillStyle = LIME; c.fillText(w, 0, 0);
+    c.restore();
+  }
+  // morphing shape
+  if (t < 2.4 || t > 5.0) return;
+  const segT = [2.4, 2.85, 3.35, 3.85, 4.3, 4.65];
+  let k = 0; while (k < segT.length - 2 && t > segT[k + 1]) k++;
+  const mp = eInOutCubic(prog(t, segT[k] + 0.12, segT[k + 1]));
+  const A = SHAPES[k], B = SHAPES[k + 1];
+  const implode = eInBack(prog(t, 4.65, 5.0));
+  const base = (60 + eOutBack(prog(t, 2.4, 2.75)) * 110) * (1 - implode);
+  const rot = (t - 2.4) * 2.2 + eInExpo(prog(t, 4.3, 5)) * 6;
+  const pulse = 1 + 0.06 * Math.sin(t * 18);
+  for (let layer = 2; layer >= 0; layer--) {
+    const lt = t - layer * 0.07, lrot = (lt - 2.4) * 2.2;
+    const sc = base * pulse * (1 + layer * 0.22);
+    c.save(); c.translate(CX, CY); c.rotate(layer ? lrot : rot);
+    c.strokeStyle = layer ? LIME2 : '#eaffc0'; c.globalAlpha = layer ? 0.35 / layer : 1;
+    c.lineWidth = layer ? 3 : 10; c.lineJoin = 'round'; c.shadowColor = LIME; c.shadowBlur = layer ? 0 : 40;
+    c.beginPath();
+    for (let i = 0; i <= NPTS; i++) {
+      const a = A[i % NPTS], b = B[i % NPTS];
+      const x = lerp(a[0], b[0], mp) * sc, y = lerp(a[1], b[1], mp) * sc;
+      i ? c.lineTo(x, y) : c.moveTo(x, y);
+    }
+    c.stroke(); c.restore();
+  }
+  // orbiting dots
+  c.save(); c.fillStyle = '#fff';
+  for (let i = 0; i < 6; i++) {
+    const a = t * 4 + i * Math.PI / 3, r = base * 1.75;
+    c.globalAlpha = 0.8 * (1 - implode); c.beginPath(); c.arc(CX + Math.cos(a) * r, CY + Math.sin(a) * r, 6, 0, Math.PI * 2); c.fill();
+  }
+  c.restore();
+}
+
+// ---------- Scene C : particle lion 5.0 -> 8.2 ----------
+function sceneParticles(t, c) {
+  if (t < 5.0 || t > 8.4) return;
+  const L = pieces.lion, w = L.w * S_LION, h = L.h * S_LION;
+  const fade = 1 - prog(t, 7.7, 8.3);
+  c.save(); c.globalCompositeOperation = 'lighter';
+  for (const p of parts) {
+    const tx = LION_STAGE.x + p.u * w, ty = LION_STAGE.y + p.v * h;
+    const e = eOutExpo(prog(t, 5.0, 5.9));
+    const sw = (t - 5) * p.swirl;
+    let x = CX + (p.ex * Math.cos(sw) - p.ey * Math.sin(sw)) * e;
+    let y = CY + (p.ex * Math.sin(sw) + p.ey * Math.cos(sw)) * e;
+    const g = eInOutCubic(prog(t, 5.6 + p.delay, 6.8 + p.delay));
+    const bend = Math.sin(g * Math.PI) * 120 * p.swirl;
+    const fx = lerp(x, tx, g) + bend, fy = lerp(y, ty, g) - bend * 0.5;
+    const s = p.size * (1 + (1 - g) * 0.6);
+    c.globalAlpha = fade * (0.55 + 0.45 * g);
+    c.fillStyle = p.hue > 0.6 ? '#ffffff' : (p.hue > 0.25 ? LIME : '#5fd12a');
+    c.fillRect(fx - s / 2, fy - s / 2, s, s);
+  }
+  c.restore();
+}
+
+// ---------- the lion (solid) 7.5 -> end ----------
+function lionState(t) {
+  // position / scale from stage -> final lockup
+  const m = eInOutCubic(prog(t, 10.0, 10.95));
+  const f = finalPos(pieces.lion);
+  return { x: lerp(LION_STAGE.x, f.x, m), y: lerp(LION_STAGE.y, f.y, m), s: lerp(S_LION, S_FINAL, m) };
+}
+
+function drawLion(t) {
+  if (t < 7.4) return;
+  const L = pieces.lion, st = lionState(t);
+  const a = smooth(7.4, 8.1, t);
+  const w = L.w * st.s, h = L.h * st.s;
+
+  // --- glitch 8.2 -> 8.9
+  const gp = prog(t, 8.2, 8.95);
+  const frame = Math.round(t * FPS);
+  let glitch = 0;
+  if (gp > 0 && gp < 1) glitch = Math.pow(Math.sin(gp * Math.PI), 0.6) * (hash(frame) > 0.35 ? 1 : 0.15);
+
+  // --- 3D flip 8.95 -> 9.85
+  const fp = eInOutCubic(prog(t, 8.95, 9.85));
+  const ang = fp * Math.PI * 2;
+  const sx = Math.cos(ang);
+  const back = sx < 0;
+  const bob = Math.sin(fp * Math.PI) * -30;
+
+  if (glitch > 0.01) {
+    const r = rng(frame * 31 + 5);
+    let yy = 0;
+    while (yy < L.c.height) {
+      const sh = (8 + r() * 60) | 0;
+      const off = (r() - .5) * 140 * glitch * (r() > .55 ? 1 : 0.15);
+      const dy = yy / L.c.height * h;
+      const dh = sh / L.c.height * h;
+      // chromatic copies
+      ctx.save(); ctx.globalAlpha = a * 0.75; ctx.globalCompositeOperation = 'lighter';
+      ctx.drawImage(L.lime, 0, yy, L.c.width, sh, st.x - w / 2 + off - 16 * glitch, st.y - h / 2 + dy, w, dh);
+      ctx.restore();
+      ctx.save(); ctx.globalAlpha = a;
+      ctx.drawImage(L.c, 0, yy, L.c.width, sh, st.x - w / 2 + off * 0.6, st.y - h / 2 + dy, w, dh);
+      ctx.restore();
+      yy += sh;
+    }
+    // scanline bars
+    ctx.save(); ctx.globalAlpha = 0.25 * glitch; ctx.fillStyle = LIME;
+    for (let i = 0; i < 5; i++) ctx.fillRect(0, r() * H, W, 2 + r() * 8);
+    ctx.restore();
+    return;
+  }
+
+  ctx.save();
+  ctx.translate(st.x, st.y + bob);
+  ctx.scale(Math.max(Math.abs(sx), 0.02) * (back ? -1 : 1), 1);
+  // edge thickness during flip
+  if (fp > 0 && fp < 1 && Math.abs(sx) < 0.98) {
+    for (let k = 6; k > 0; k--) {
+      ctx.globalAlpha = a; ctx.drawImage(L.deep, -w / 2 + k * 2 * Math.sign(Math.sin(ang)), -h / 2, w, h);
+    }
+  }
+  ctx.globalAlpha = a;
+  ctx.drawImage(back ? L.lime : L.c, -w / 2, -h / 2, w, h);
+  ctx.restore();
+}
+
+// ---------- letters 10.8 -> end ----------
+function drawLetters(t) {
+  if (t < 10.7) return;
+  // LSG : L from left w/ skew, S spins in, G from right
+  const L = pieces.lsg;
+  L.forEach((p, i) => {
+    const t0 = 10.85 + i * 0.18, e = prog(t, t0, t0 + 0.65);
+    if (e <= 0) return;
+    const f = finalPos(p);
+    const eb = eOutBack(e), ec = eOutExpo(e);
+    let x = f.x, y = f.y, opt = { alpha: clamp(e * 3) };
+    const n = L.length, mid = (n - 1) / 2;
+    if (i < mid) { x = lerp(-300, f.x, ec); opt.skew = (1 - ec) * -0.8; }
+    else if (i > mid) { x = lerp(W + 300, f.x, ec); opt.skew = (1 - ec) * 0.8; }
+    else { opt.rot = (1 - eb) * Math.PI * 1.5; opt.sx = opt.sy = eb; }
+    // motion trail
+    if (e < 1 && i !== mid) {
+      for (let k = 1; k <= 5; k++) {
+        const ek = eOutExpo(clamp(e - k * 0.03));
+        const xk = i < mid ? lerp(-300, f.x, ek) : lerp(W + 300, f.x, ek);
+        drawPiece(p.c, p, xk, y, S_FINAL, { alpha: 0.12 * (1 - e), skew: opt.skew });
+      }
+    }
+    drawPiece(p.c, p, x, y, S_FINAL, opt);
+  });
+  // light bar running under LSG
+  const lb = prog(t, 11.15, 11.9);
+  if (lb > 0 && lb < 1) {
+    const top = finalPos(L[0]).y + L[0].h * S_FINAL / 2 + 12;
+    const x0 = finalPos(L[0]).x - L[0].w * S_FINAL / 2, x1 = finalPos(L[L.length - 1]).x + L[L.length - 1].w * S_FINAL / 2;
+    const hx = lerp(x0 - 200, x1 + 200, eInOutCubic(lb));
+    const g = ctx.createLinearGradient(hx - 350, 0, hx, 0);
+    g.addColorStop(0, 'rgba(255,255,255,0)'); g.addColorStop(1, 'rgba(255,255,255,1)');
+    ctx.save(); ctx.globalAlpha = Math.sin(lb * Math.PI); ctx.fillStyle = g; ctx.fillRect(hx - 350, top, 350, 5); ctx.restore();
+  }
+  // RACING : drop in + tracking tighten
+  const R = pieces.racing, rc = (R.length - 1) / 2;
+  R.forEach((p, i) => {
+    const t0 = 11.75 + i * 0.07, e = prog(t, t0, t0 + 0.55);
+    if (e <= 0) return;
+    const f = finalPos(p), track = 1 + 1.4 * (1 - eOutCubic(prog(t, 11.75, 12.8)));
+    const x = CX + (f.x - CX) * track;
+    const y = lerp(f.y - 110, f.y, eOutBack(e));
+    drawPiece(p.c, p, x, y, S_FINAL, { alpha: clamp(e * 2.5), rot: (1 - eOutCubic(e)) * (i - rc) * 0.25 });
+  });
+}
+
+// ---------- shine sweep on the foreground layer ----------
+function shine(t, t0, t1, width = 260, strength = 0.9) {
+  const p = prog(t, t0, t1); if (p <= 0 || p >= 1) return;
+  const x = lerp(-600, W + 600, eInOutCubic(p));
+  fgx.save(); fgx.globalCompositeOperation = 'source-atop';
+  const g = fgx.createLinearGradient(x - width, 0, x + width, 0);
+  g.addColorStop(0, 'rgba(255,255,255,0)'); g.addColorStop(0.5, `rgba(255,255,255,${strength})`); g.addColorStop(1, 'rgba(255,255,255,0)');
+  fgx.translate(x, CY); fgx.rotate(0.35); fgx.translate(-x, -CY);
+  fgx.fillStyle = g; fgx.fillRect(x - width, -800, width * 2, H + 1600);
+  fgx.restore();
+}
+
+// ===========================================================================
+function render(frame) {
+  const t = frame / FPS;
+  ctx.save();
+  ctx.clearRect(0, 0, W, H);
+
+  // camera: shakes + final push in
+  const shake = Math.max(1 - prog(t, 2.0, 2.35), 0) * (t >= 2 ? 1 : 0) * 14 + (t >= 5 ? (1 - prog(t, 5, 5.35)) * 18 : 0) + (t >= 10.8 ? (1 - prog(t, 10.8, 11.0)) * 6 : 0);
+  const sr = rng(frame + 1);
+  const camS = 1 + 0.045 * eInOutCubic(prog(t, 11.5, 15)) + (t < 2 ? 0.03 * prog(t, 0, 2) : 0);
+  ctx.translate(CX + (sr() - .5) * shake, CY + (sr() - .5) * shake); ctx.scale(camS, camS); ctx.translate(-CX, -CY);
+
+  background(t);
+
+  // ambient dust on green
+  if (t > 10.2) {
+    const da = prog(t, 10.2, 11);
+    ctx.save(); ctx.fillStyle = '#efffd0';
+    for (const d of dust) {
+      const y = (d.y - (t - 10) * d.v + H) % H, x = d.x + Math.sin(t * 1.5 + d.ph) * 20;
+      ctx.globalAlpha = da * 0.35; ctx.beginPath(); ctx.arc(x, y, d.s, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  sceneLights(t, ctx);
+  sceneMorph(t, ctx);
+  sceneParticles(t, ctx);
+
+  // foreground logo layer (gets shine + glow)
+  fgx.clearRect(0, 0, W, H);
+  // draw into fg layer using the same camera
+  fgx.setTransform(ctx.getTransform());
+  swapCtx(fgx, () => { drawLion(t); drawLetters(t); });
+  fgx.setTransform(1, 0, 0, 1, 0, 0);
+  shine(t, 7.75, 8.6, 220, 0.85);
+  shine(t, 13.3, 14.3, 320, 0.8);
+  shine(t, 14.35, 14.9, 120, 0.6);
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  // drop shadow on green, glow on dark
+  const onGreen = prog(t, 9.8, 10.6);
+  if (onGreen > 0) {
+    ctx.save(); ctx.globalAlpha = 0.35 * onGreen; ctx.filter = 'blur(18px)';
+    ctx.drawImage(tint(fg, '#0a2e09'), 10, 18); ctx.restore();
+  }
+  ctx.save(); ctx.globalAlpha = 0.55 * (1 - onGreen * 0.6); ctx.globalCompositeOperation = 'lighter'; ctx.filter = 'blur(26px)';
+  ctx.drawImage(fg, 0, 0); ctx.restore();
+  ctx.drawImage(fg, 0, 0);
+
+  // flashes
+  const flash = Math.max(
+    (t >= 2.0 ? 1 - prog(t, 2.0, 2.3) : 0) * 0.55,
+    (t >= 5.0 ? 1 - prog(t, 5.0, 5.4) : 0) * 0.85,
+    (t >= 14.75 ? prog(t, 14.75, 15) : 0) * 0.0
+  );
+  if (flash > 0) { ctx.save(); ctx.globalAlpha = flash; ctx.fillStyle = t < 4 ? '#c8ff8a' : '#ffffff'; ctx.fillRect(0, 0, W, H); ctx.restore(); }
+
+  // vignette + letterbox fade-in
+  const v = ctx.createRadialGradient(CX, CY, 400, CX, CY, 1150);
+  v.addColorStop(0, 'rgba(0,0,0,0)'); v.addColorStop(1, 'rgba(0,0,0,0.55)');
+  ctx.fillStyle = v; ctx.fillRect(0, 0, W, H);
+  const fin = 1 - prog(t, 0, 0.35);
+  if (fin > 0) { ctx.fillStyle = `rgba(0,0,0,${fin})`; ctx.fillRect(0, 0, W, H); }
+  ctx.restore();
+}
+
+// draw functions use the global `ctx`; temporarily point it at another context
+function swapCtx(target, fn) { const saved = ctx; ctx = target; try { fn(); } finally { ctx = saved; } }
+
+window.init = src => new Promise((res, rej) => {
+  const img = new Image();
+  img.onload = () => { prepare(img); res(window.__debug); };
+  img.onerror = rej; img.src = src;
+});
+window.render = render;
+</script>
+</body>
+</html>
